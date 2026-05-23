@@ -1,11 +1,11 @@
 """
 Runs inside a GitHub Actions Ubuntu runner.
 
-Logs into ivasms.com using Camoufox (a Firefox-based stealth browser that
-ships as a tiny Linux binary - no full Chrome install needed), captures the
-fresh cookies + User-Agent, then uploads them to a private GitHub Gist so
-the bot running on hidencloud (no browser, no terminal access) can pick
-them up via simple HTTPS polling.
+Logs into ivasms.com using Camoufox (Firefox-based stealth browser),
+captures fresh cookies + UA, uploads them to a private GitHub Gist.
+
+Cloudflare on GH Actions Azure IPs throws hard challenges, so we patiently
+wait for cf_clearance to land before touching the form.
 
 Required env vars:
     IVASMS_EMAIL
@@ -28,7 +28,10 @@ from camoufox.sync_api import Camoufox
 LOGIN_URL = "https://www.ivasms.com/login"
 PORTAL_URL = "https://www.ivasms.com/portal"
 PORTAL_HINT = "/portal"
-TIMEOUT_SECS = 180
+
+# Cloudflare needs time on Azure IPs (GH Actions). Be generous.
+CHALLENGE_WAIT_SECS = 240
+LOGIN_WAIT_SECS = 240
 
 
 def must_env(name: str) -> str:
@@ -36,6 +39,55 @@ def must_env(name: str) -> str:
     if not val:
         sys.exit(f"X env var {name} is required")
     return val
+
+
+def has_cf_clearance(cookies: list[dict]) -> bool:
+    return any(c.get("name") == "cf_clearance" and c.get("value") for c in cookies)
+
+
+def wait_for_cf_clearance(page, deadline: float) -> bool:
+    """Spin until cf_clearance lands in the cookie jar."""
+    while time.time() < deadline:
+        try:
+            cookies = page.context.cookies("https://www.ivasms.com")
+        except Exception:
+            cookies = []
+        if has_cf_clearance(cookies):
+            return True
+        try:
+            # Nudge the page so Cloudflare's challenge keeps progressing
+            page.mouse.move(100, 100)
+            page.mouse.move(300, 220)
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def wait_for_login_form(page, deadline: float) -> bool:
+    """Wait for the email field to appear, retrying through CF redirects."""
+    while time.time() < deadline:
+        try:
+            handle = page.query_selector("input[name='email']")
+            if handle and handle.is_visible():
+                return True
+        except Exception:
+            pass
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        if "challenges.cloudflare.com" in url or "cdn-cgi" in url:
+            time.sleep(3)
+            continue
+        if "/login" not in url and PORTAL_HINT not in url:
+            # Got bounced somewhere weird - try a hard reload
+            try:
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
+            except Exception:
+                pass
+        time.sleep(2)
+    return False
 
 
 def grab_cookies() -> dict[str, Any]:
@@ -47,36 +99,54 @@ def grab_cookies() -> dict[str, Any]:
     user_agent: str = ""
 
     with Camoufox(
-        headless="virtual",   # Xvfb on Linux runners
-        humanize=True,        # natural mouse + typing rhythm
+        headless="virtual",
+        humanize=True,
+        os=("windows",),
+        geoip=True,
+        locale=("en-US",),
     ) as browser:
         page = browser.new_page()
+        page.set_default_timeout(60_000)
+
         print(f"=> opening {LOGIN_URL}", flush=True)
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-
-        # Cloudflare may show a challenge. Camoufox passes it; we just wait
-        # until the form is interactive.
         try:
-            page.wait_for_load_state("networkidle", timeout=60_000)
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
         except Exception as e:
-            print(f"!! networkidle wait timed out: {e}", flush=True)
+            print(f"!! initial goto raised: {e}", flush=True)
 
+        # Pass the Cloudflare challenge
+        cf_deadline = time.time() + CHALLENGE_WAIT_SECS
+        if wait_for_cf_clearance(page, cf_deadline):
+            print("=> cf_clearance acquired", flush=True)
+        else:
+            print("!! cf_clearance never appeared, trying anyway", flush=True)
+
+        # Sometimes the form needs an explicit nudge after the challenge
         try:
-            page.wait_for_selector("input[name='email']", timeout=90_000)
-        except Exception as e:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
+        except Exception:
+            pass
+
+        login_deadline = time.time() + LOGIN_WAIT_SECS
+        if not wait_for_login_form(page, login_deadline):
+            try:
+                page.screenshot(path="/tmp/cf_blocked.png", full_page=True)
+                print("!! screenshot saved /tmp/cf_blocked.png", flush=True)
+            except Exception:
+                pass
             try:
                 html = page.content()[:1500]
             except Exception:
-                html = "<could not read page content>"
-            sys.exit(f"X login form not found: {e}\n--- page (truncated) ---\n{html}")
+                html = "<no content>"
+            sys.exit(f"X login form never appeared\n--- (truncated) ---\n{html}")
 
         print("=> typing credentials...", flush=True)
         page.fill("input[name='email']", email)
         page.fill("input[name='password']", password)
         page.click("button[type='submit']")
 
-        # Wait for redirect to /portal (Cloudflare may interject)
-        deadline = time.time() + TIMEOUT_SECS
+        # Wait for /portal redirect
+        deadline = time.time() + 180
         while time.time() < deadline:
             url = page.url
             if PORTAL_HINT in url and "/login" not in url:
@@ -85,11 +155,9 @@ def grab_cookies() -> dict[str, Any]:
         else:
             sys.exit(f"X never reached /portal (last url={page.url})")
 
-        # Touch a couple of pages so the AJAX/CSRF token is also alive
         try:
-            page.goto(f"{PORTAL_URL}/sms/received", wait_until="domcontentloaded",
-                      timeout=60_000)
-            page.wait_for_load_state("networkidle", timeout=30_000)
+            page.goto(f"{PORTAL_URL}/sms/received",
+                      wait_until="domcontentloaded", timeout=60_000)
         except Exception:
             pass
 
@@ -113,7 +181,6 @@ def grab_cookies() -> dict[str, Any]:
 
 
 def normalise_for_client(cookies: list[dict]) -> list[dict]:
-    """Match the shape the bot expects: name/value/domain/path only."""
     out: list[dict] = []
     for c in cookies:
         name = c.get("name")
@@ -131,7 +198,6 @@ def normalise_for_client(cookies: list[dict]) -> list[dict]:
 
 def has_critical(cookies: list[dict]) -> bool:
     names = {c.get("name") for c in cookies}
-    # cf_clearance + a Laravel session = a working login
     return "cf_clearance" in names and any(
         n in names for n in ("ivas_sms_session", "laravel_session", "XSRF-TOKEN")
     )
