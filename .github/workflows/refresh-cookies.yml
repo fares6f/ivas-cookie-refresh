@@ -1,0 +1,49 @@
+name: Refresh ivasms cookies
+
+on:
+  # Every 30 minutes
+  schedule:
+    - cron: "*/30 * * * *"
+  # And on demand from the Actions tab
+  workflow_dispatch:
+
+# Don't let two runs overlap
+concurrency:
+  group: refresh-cookies
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Camoufox + requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install "camoufox[geoip]>=0.4.11" requests
+
+      - name: Fetch Camoufox browser binary
+        run: python -m camoufox fetch
+
+      - name: Install Xvfb (virtual display)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Run cookie refresh
+        env:
+          IVASMS_EMAIL: ${{ secrets.IVASMS_EMAIL }}
+          IVASMS_PASSWORD: ${{ secrets.IVASMS_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: python scripts/refresh_cookies_action.py
