@@ -1,26 +1,26 @@
 """
 Runs inside a GitHub Actions Ubuntu runner.
 
-Logs into ivasms.com using Camoufox (Firefox-based stealth browser),
-captures fresh cookies + UA, uploads them to a private GitHub Gist.
-
-Cloudflare on GH Actions Azure IPs throws hard challenges, so we patiently
-wait for cf_clearance to land before touching the form.
+Logs into ivasms.com via Camoufox routed through a residential proxy
+(Cloudflare blocks Azure datacenter IPs that GH Actions runs on).
+Captures fresh cookies + UA, uploads them to a private Gist.
 
 Required env vars:
     IVASMS_EMAIL
     IVASMS_PASSWORD
     GH_TOKEN          - GitHub PAT with `gist` scope
     GIST_ID           - the target private Gist's id
+    PROXIES           - newline-separated list of host:port:user:pass
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import sys
 import time
-from typing import Any
+from typing import Any, Optional
 
 import requests
 from camoufox.sync_api import Camoufox
@@ -29,9 +29,9 @@ LOGIN_URL = "https://www.ivasms.com/login"
 PORTAL_URL = "https://www.ivasms.com/portal"
 PORTAL_HINT = "/portal"
 
-# Cloudflare needs time on Azure IPs (GH Actions). Be generous.
-CHALLENGE_WAIT_SECS = 240
-LOGIN_WAIT_SECS = 240
+CHALLENGE_WAIT_SECS = 120
+LOGIN_WAIT_SECS = 90
+PROXY_ATTEMPTS = 4
 
 
 def must_env(name: str) -> str:
@@ -41,12 +41,34 @@ def must_env(name: str) -> str:
     return val
 
 
+def load_proxies() -> list[dict]:
+    raw = os.environ.get("PROXIES", "").strip()
+    if not raw:
+        return []
+    out: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) != 4:
+            continue
+        host, port, user, pwd = parts
+        out.append({
+            "server": f"http://{host}:{port}",
+            "username": user,
+            "password": pwd,
+            "label": f"{host}:{port}",
+        })
+    random.shuffle(out)
+    return out
+
+
 def has_cf_clearance(cookies: list[dict]) -> bool:
     return any(c.get("name") == "cf_clearance" and c.get("value") for c in cookies)
 
 
 def wait_for_cf_clearance(page, deadline: float) -> bool:
-    """Spin until cf_clearance lands in the cookie jar."""
     while time.time() < deadline:
         try:
             cookies = page.context.cookies("https://www.ivasms.com")
@@ -55,9 +77,7 @@ def wait_for_cf_clearance(page, deadline: float) -> bool:
         if has_cf_clearance(cookies):
             return True
         try:
-            # Nudge the page so Cloudflare's challenge keeps progressing
-            page.mouse.move(100, 100)
-            page.mouse.move(300, 220)
+            page.mouse.move(random.randint(50, 400), random.randint(80, 300))
         except Exception:
             pass
         time.sleep(2)
@@ -65,7 +85,6 @@ def wait_for_cf_clearance(page, deadline: float) -> bool:
 
 
 def wait_for_login_form(page, deadline: float) -> bool:
-    """Wait for the email field to appear, retrying through CF redirects."""
     while time.time() < deadline:
         try:
             handle = page.query_selector("input[name='email']")
@@ -73,114 +92,96 @@ def wait_for_login_form(page, deadline: float) -> bool:
                 return True
         except Exception:
             pass
-        try:
-            url = page.url
-        except Exception:
-            url = ""
-        if "challenges.cloudflare.com" in url or "cdn-cgi" in url:
-            time.sleep(3)
-            continue
-        if "/login" not in url and PORTAL_HINT not in url:
-            # Got bounced somewhere weird - try a hard reload
-            try:
-                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
-            except Exception:
-                pass
         time.sleep(2)
     return False
 
 
-def grab_cookies() -> dict[str, Any]:
-    email = must_env("IVASMS_EMAIL")
-    password = must_env("IVASMS_PASSWORD")
+def try_with_proxy(proxy: Optional[dict]) -> Optional[dict[str, Any]]:
+    """One attempt: returns payload on success, None on failure."""
+    label = proxy["label"] if proxy else "no-proxy"
+    print(f"\n=> attempt via {label}", flush=True)
 
-    print("=> launching Camoufox (virtual display)...", flush=True)
-    cookies: list[dict] = []
-    user_agent: str = ""
-
-    with Camoufox(
+    kwargs: dict[str, Any] = dict(
         headless="virtual",
         humanize=True,
         os=("windows",),
-        geoip=True,
         locale=("en-US",),
-    ) as browser:
-        page = browser.new_page()
-        page.set_default_timeout(60_000)
+        geoip=True,
+    )
+    if proxy:
+        kwargs["proxy"] = {
+            "server": proxy["server"],
+            "username": proxy["username"],
+            "password": proxy["password"],
+        }
 
-        print(f"=> opening {LOGIN_URL}", flush=True)
-        try:
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-        except Exception as e:
-            print(f"!! initial goto raised: {e}", flush=True)
+    try:
+        with Camoufox(**kwargs) as browser:
+            page = browser.new_page()
+            page.set_default_timeout(60_000)
 
-        # Pass the Cloudflare challenge
-        cf_deadline = time.time() + CHALLENGE_WAIT_SECS
-        if wait_for_cf_clearance(page, cf_deadline):
-            print("=> cf_clearance acquired", flush=True)
-        else:
-            print("!! cf_clearance never appeared, trying anyway", flush=True)
-
-        # Sometimes the form needs an explicit nudge after the challenge
-        try:
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
-        except Exception:
-            pass
-
-        login_deadline = time.time() + LOGIN_WAIT_SECS
-        if not wait_for_login_form(page, login_deadline):
             try:
-                page.screenshot(path="/tmp/cf_blocked.png", full_page=True)
-                print("!! screenshot saved /tmp/cf_blocked.png", flush=True)
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
+            except Exception as e:
+                print(f"!! initial goto raised: {e}", flush=True)
+                return None
+
+            if not wait_for_cf_clearance(page, time.time() + CHALLENGE_WAIT_SECS):
+                print("!! cf_clearance never appeared via this proxy", flush=True)
+                return None
+            print("=> cf_clearance acquired", flush=True)
+
+            try:
+                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
             except Exception:
                 pass
+
+            if not wait_for_login_form(page, time.time() + LOGIN_WAIT_SECS):
+                print("!! login form did not appear", flush=True)
+                return None
+
+            print("=> typing credentials...", flush=True)
+            email = must_env("IVASMS_EMAIL")
+            password = must_env("IVASMS_PASSWORD")
+            page.fill("input[name='email']", email)
+            page.fill("input[name='password']", password)
+            page.click("button[type='submit']")
+
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                url = page.url
+                if PORTAL_HINT in url and "/login" not in url:
+                    break
+                time.sleep(2)
+            else:
+                print(f"!! never reached /portal (last url={page.url})", flush=True)
+                return None
+
             try:
-                html = page.content()[:1500]
+                page.goto(f"{PORTAL_URL}/sms/received",
+                          wait_until="domcontentloaded", timeout=45_000)
             except Exception:
-                html = "<no content>"
-            sys.exit(f"X login form never appeared\n--- (truncated) ---\n{html}")
+                pass
 
-        print("=> typing credentials...", flush=True)
-        page.fill("input[name='email']", email)
-        page.fill("input[name='password']", password)
-        page.click("button[type='submit']")
+            print(f"=> logged in: {page.url}", flush=True)
 
-        # Wait for /portal redirect
-        deadline = time.time() + 180
-        while time.time() < deadline:
-            url = page.url
-            if PORTAL_HINT in url and "/login" not in url:
-                break
-            time.sleep(2)
-        else:
-            sys.exit(f"X never reached /portal (last url={page.url})")
+            cookies = page.context.cookies("https://www.ivasms.com")
+            try:
+                user_agent = page.evaluate("() => navigator.userAgent") or ""
+            except Exception:
+                user_agent = ""
 
-        try:
-            page.goto(f"{PORTAL_URL}/sms/received",
-                      wait_until="domcontentloaded", timeout=60_000)
-        except Exception:
-            pass
-
-        print(f"=> logged in: {page.url}", flush=True)
-
-        cookies = page.context.cookies("https://www.ivasms.com")
-        try:
-            user_agent = page.evaluate("() => navigator.userAgent") or ""
-        except Exception:
-            user_agent = ""
-
-    print(f"=> captured {len(cookies)} cookies", flush=True)
-    if user_agent:
-        print(f"=> user-agent: {user_agent[:80]}...", flush=True)
-
-    return {
-        "cookies": cookies,
-        "user_agent": user_agent,
-        "captured_at": int(time.time()),
-    }
+            return {
+                "cookies": cookies,
+                "user_agent": user_agent,
+                "captured_at": int(time.time()),
+            }
+    except Exception as e:
+        print(f"!! attempt errored: {e}", flush=True)
+        return None
 
 
-def normalise_for_client(cookies: list[dict]) -> list[dict]:
+def normalise(cookies: list[dict]) -> list[dict]:
     out: list[dict] = []
     for c in cookies:
         name = c.get("name")
@@ -215,7 +216,6 @@ def upload_to_gist(payload: dict) -> None:
             "captured_at.txt": {"content": str(payload["captured_at"])},
         }
     }
-
     url = f"https://api.github.com/gists/{gist_id}"
     headers = {
         "Authorization": f"token {token}",
@@ -229,13 +229,28 @@ def upload_to_gist(payload: dict) -> None:
 
 
 def main() -> None:
-    payload = grab_cookies()
-    cookies = normalise_for_client(payload["cookies"])
+    proxies = load_proxies()
+    if not proxies:
+        sys.exit("X PROXIES env var is empty")
+
+    print(f"=> {len(proxies)} proxies loaded; will try up to {PROXY_ATTEMPTS}", flush=True)
+
+    payload: Optional[dict] = None
+    for proxy in proxies[:PROXY_ATTEMPTS]:
+        payload = try_with_proxy(proxy)
+        if payload:
+            break
+
+    if not payload:
+        sys.exit("X every proxy attempt failed")
+
+    cookies = normalise(payload["cookies"])
     if not cookies:
         sys.exit("X no cookies captured")
     if not has_critical(cookies):
         names = [c.get("name") for c in cookies]
         sys.exit(f"X login looks incomplete; got {names}")
+
     payload["cookies"] = cookies
     upload_to_gist(payload)
     print("== done ==", flush=True)
